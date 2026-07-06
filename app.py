@@ -11,6 +11,7 @@ Secrets (Streamlit Cloud app settings → Secrets, TOML):
   FHA_UPLOADER_PASSCODE   staff passcode (empty/absent = no gate)
   FHA_DRIVE_INBOX_ID      Drive folder id of FHA-Dockets/inbox
 """
+import hashlib
 import os
 import re
 from datetime import date, timedelta
@@ -121,6 +122,17 @@ def safe_name(name):
     return base
 
 
+def folder_md5s(folder_id):
+    """md5 of every file already in the day folder — catches re-uploads of
+    the same file under a different name (browser '(1)' copies)."""
+    r = requests.get(f"{DRIVE}/files",
+                     params={"q": f"'{folder_id}' in parents and trashed = false",
+                             "fields": "files(md5Checksum)", "pageSize": 500},
+                     headers=_headers(), timeout=30)
+    r.raise_for_status()
+    return {f["md5Checksum"] for f in r.json().get("files", []) if f.get("md5Checksum")}
+
+
 def unique_name(folder_id, name):
     stem, ext = os.path.splitext(name)
     candidate, n = name, 0
@@ -178,6 +190,11 @@ if uploads and st.button(f"Send {len(uploads)} file(s) for {folder_name}",
             errors.append(f"Upload service unreachable ({e}) — nothing sent. "
                           "Try again or call Nathan.")
         if day_folder:
+            try:
+                existing_md5 = folder_md5s(day_folder)
+            except Exception:
+                existing_md5 = set()
+            skipped_dupes = []
             for up in uploads:
                 data = up.getbuffer()
                 if len(data) > MAX_FILE_MB * 1024 * 1024:
@@ -186,13 +203,21 @@ if uploads and st.button(f"Send {len(uploads)} file(s) for {folder_name}",
                 if not bytes(data[:5]) == b"%PDF-":
                     errors.append(f"{up.name}: not a valid PDF, skipped")
                     continue
+                digest = hashlib.md5(bytes(data)).hexdigest()
+                if digest in existing_md5:
+                    skipped_dupes.append(up.name)
+                    continue
                 try:
                     name = unique_name(day_folder, safe_name(up.name))
                     upload_pdf(day_folder, name, data)
                     saved.append(name)
+                    existing_md5.add(digest)
                 except Exception:
                     errors.append(f"{up.name}: upload failed — try again or "
                                   "call Nathan.")
+            if skipped_dupes:
+                st.info("Already uploaded (identical file), skipped: "
+                        + ", ".join(skipped_dupes))
     if saved:
         st.success(f"Sent for {folder_name}: " + ", ".join(saved))
     for e in errors:
